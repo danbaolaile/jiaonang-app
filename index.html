@@ -1826,6 +1826,10 @@ legend {
 }
 body.map-open { overflow: hidden; }
 
+
+/* 导入课表说明 */
+.data-note { font-size: 13px; opacity: .75; margin: 4px 0 0; }
+
 </style>
 </head>
 <body>
@@ -3961,6 +3965,10 @@ boot().catch((err) =&gt; {
         <label class="btn btn-block" for="import-file">导入数据（JSON）</label>
         <input id="import-file" class="hidden" type="file" accept=".json">
 
+        <label class="btn btn-block" for="import-xlsx">导入课表（Excel .xlsx）</label>
+        <input id="import-xlsx" class="hidden" type="file" accept=".xlsx">
+        <p class="data-note">支持教务导出的课表：优先读「课程明细」表，没有明细表时读「课程表」网格；节次时间优先取表内时间；非全学期周段会跟在课程名后面；导入是合并，不会覆盖已有作业和进度。</p>
+
         <button id="btn-demo" class="btn btn-block" type="button">填充演示数据</button>
         <button id="btn-ics-mine" class="btn btn-block" type="button">导出日历（.ics）</button>
         <button id="btn-show-intro" class="btn btn-block" type="button">使用说明</button>
@@ -5404,6 +5412,240 @@ window.addEventListener('message', (e) => {
   toggleDone(appId);
   renderCapsules();
   showToast('已点亮 ✓');
+});
+
+// ===== 导入课表（Excel .xlsx，教务导出格式）=====
+// 读法：优先「课程明细」表（星期/节次/课程名称/上课地点/授课教师），
+// 没有明细表时读「课程表」网格；节次时间优先取表内时间，缺省用常用时间。
+const XLSX_WEEKDAYS = { '星期一': 1, '星期二': 2, '星期三': 3, '星期四': 4, '星期五': 5, '星期六': 6, '星期日': 7, '星期天': 7 };
+const XLSX_DEFAULT_SLOTS = {
+  '第1-2节': [480, 575], '第3-4节': [600, 695], '第5-6节': [840, 935],
+  '第7-8节': [960, 1055], '第9-10节': [1140, 1235]
+};
+
+function xlsxUnzip(buf) {
+  const bytes = new Uint8Array(buf);
+  const view = new DataView(buf);
+  let eocd = -1;
+  for (let i = bytes.length - 22; i >= 0; i--) {
+    if (bytes[i] === 0x50 && bytes[i + 1] === 0x4b && bytes[i + 2] === 0x05 && bytes[i + 3] === 0x06) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error('not a zip');
+  const count = view.getUint16(eocd + 10, true);
+  let off = view.getUint32(eocd + 16, true);
+  const entries = new Map();
+  const decode = new TextDecoder();
+  for (let n = 0; n < count; n++) {
+    const method = view.getUint16(off + 10, true);
+    const compSize = view.getUint32(off + 20, true);
+    const nameLen = view.getUint16(off + 28, true);
+    const extraLen = view.getUint16(off + 30, true);
+    const commentLen = view.getUint16(off + 32, true);
+    const localOff = view.getUint32(off + 42, true);
+    const name = decode.decode(bytes.subarray(off + 46, off + 46 + nameLen));
+    const lNameLen = view.getUint16(localOff + 26, true);
+    const lExtraLen = view.getUint16(localOff + 28, true);
+    const dataStart = localOff + 30 + lNameLen + lExtraLen;
+    entries.set(name, { method, comp: bytes.subarray(dataStart, dataStart + compSize) });
+    off += 46 + nameLen + extraLen + commentLen;
+  }
+  return entries;
+}
+
+async function xlsxInflate(entry) {
+  if (entry.method === 0) return entry.comp;
+  if (entry.method !== 8) throw new Error('unsupported compression');
+  const stream = new Blob([entry.comp]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+function xlsxSheetRows(doc, shared) {
+  const rows = [];
+  const rowEls = doc.getElementsByTagName('row');
+  for (let r = 0; r < rowEls.length; r++) {
+    const cells = [];
+    let nextIdx = 0;
+    const cEls = rowEls[r].getElementsByTagName('c');
+    for (let i = 0; i < cEls.length; i++) {
+      const c = cEls[i];
+      const t = c.getAttribute('t');
+      const vEls = c.getElementsByTagName('v');
+      const isEls = c.getElementsByTagName('is');
+      let val = '';
+      if (t === 's' && vEls.length) val = shared[Number(vEls[0].textContent)] || '';
+      else if (isEls.length) val = isEls[0].textContent;
+      else if (vEls.length) val = vEls[0].textContent;
+      const ref = c.getAttribute('r') || '';
+      const colLetters = ref.replace(/[0-9]/g, '');
+      let idx = nextIdx;
+      if (colLetters) {
+        idx = 0;
+        for (const ch of colLetters) idx = idx * 26 + (ch.charCodeAt(0) - 64);
+        idx -= 1;
+      }
+      cells[idx] = val;
+      nextIdx = idx + 1;
+    }
+    rows.push(cells.map(v => v || ''));
+  }
+  return rows;
+}
+
+function xlsxTimeRange(text) {
+  const m = (text || '').match(/(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})/);
+  if (!m) return null;
+  const start = Number(m[1]) * 60 + Number(m[2]);
+  const end = Number(m[3]) * 60 + Number(m[4]);
+  return end > start ? [start, end] : null;
+}
+
+function xlsxDisplayName(name, weeks) {
+  const w = (weeks || '').trim();
+  if (!w || w === '1-16周') return name;
+  return name + '（' + w.replace(/\(/g, '·').replace(/\)/g, '') + '）';
+}
+
+async function xlsxParse(entries) {
+  const parseXml = async name => {
+    const entry = entries.get(name);
+    if (!entry) return null;
+    const text = new TextDecoder().decode(await xlsxInflate(entry));
+    return new DOMParser().parseFromString(text, 'application/xml');
+  };
+  const sharedDoc = await parseXml('xl/sharedStrings.xml');
+  const shared = [];
+  if (sharedDoc) {
+    const siEls = sharedDoc.getElementsByTagName('si');
+    for (let i = 0; i < siEls.length; i++) shared.push(siEls[i].textContent);
+  }
+  const relsDoc = await parseXml('xl/_rels/workbook.xml.rels');
+  const relMap = {};
+  if (relsDoc) {
+    const relEls = relsDoc.getElementsByTagName('Relationship');
+    for (let i = 0; i < relEls.length; i++) {
+      relMap[relEls[i].getAttribute('Id')] = relEls[i].getAttribute('Target') || '';
+    }
+  }
+  const bookDoc = await parseXml('xl/workbook.xml');
+  if (!bookDoc) throw new Error('bad workbook');
+  const sheets = {};
+  const sheetEls = bookDoc.getElementsByTagName('sheet');
+  for (let i = 0; i < sheetEls.length; i++) {
+    const name = sheetEls[i].getAttribute('name') || '';
+    let target = relMap[sheetEls[i].getAttribute('r:id')] || '';
+    if (target.startsWith('/')) target = target.slice(1);
+    else if (!target.startsWith('xl/')) target = 'xl/' + target;
+    const doc = await parseXml(target);
+    if (doc) sheets[name] = xlsxSheetRows(doc, shared);
+  }
+
+  const slotMap = { ...XLSX_DEFAULT_SLOTS };
+  const grid = sheets['课程表'];
+  if (grid) {
+    grid.forEach(row => {
+      const slot = (row[0] || '').trim();
+      const span = xlsxTimeRange(row[1] || '');
+      if (slot && span) slotMap[slot] = span;
+    });
+  }
+
+  const courses = [];
+  let skipped = 0;
+  const pushCourse = (name, weekday, slot, place, teacher, weeks) => {
+    const span = slotMap[(slot || '').trim()];
+    if (!name || !weekday || !span) { skipped++; return; }
+    courses.push({
+      id: uid(), name: xlsxDisplayName(name, weeks), weekday,
+      startMin: span[0], endMin: span[1],
+      place: (place || '').trim(), link: '', teacher: (teacher || '').trim()
+    });
+  };
+
+  const detail = sheets['课程明细'];
+  if (detail && detail.length > 1) {
+    const header = detail[0].map(h => (h || '').trim());
+    const col = title => header.indexOf(title);
+    const iWd = col('星期'), iSlot = col('节次'), iName = col('课程名称'),
+      iWeeks = col('上课周段'), iPlace = col('上课地点'), iTeacher = col('授课教师');
+    if (iWd >= 0 && iSlot >= 0 && iName >= 0) {
+      detail.slice(1).forEach(row => {
+        pushCourse((row[iName] || '').trim(), XLSX_WEEKDAYS[(row[iWd] || '').trim()],
+          (row[iSlot] || '').trim(), iPlace >= 0 ? row[iPlace] : '',
+          iTeacher >= 0 ? row[iTeacher] : '', iWeeks >= 0 ? row[iWeeks] : '');
+      });
+    }
+  }
+  if (!courses.length && grid) {
+    let headerRow = -1;
+    const wdByCol = {};
+    grid.forEach((row, ri) => {
+      row.forEach((cell, ci) => {
+        const wd = XLSX_WEEKDAYS[(cell || '').trim()];
+        if (wd) { wdByCol[ci] = wd; headerRow = ri; }
+      });
+    });
+    if (headerRow >= 0) {
+      grid.slice(headerRow + 1).forEach(row => {
+        const span = xlsxTimeRange(row[1] || '') || slotMap[(row[0] || '').trim()];
+        if (!span) return;
+        Object.keys(wdByCol).forEach(ci => {
+          const cell = row[Number(ci)] || '';
+          if (!cell.trim()) return;
+          const lines = cell.split('\n');
+          let entry = [];
+          const flush = () => {
+            if (!entry.length) return;
+            const rawName = (entry[0] || '').trim().replace(/[★☆■◆○]+$/g, '');
+            const weeks = (entry[1] || '').replace(/^周数\s*[:：]/, '').trim();
+            pushCourse(rawName, wdByCol[ci], row[0], entry[2] || '', entry[3] || '', weeks);
+            entry = [];
+          };
+          lines.forEach(line => {
+            if (/^[─\s]+$/.test(line)) flush();
+            else entry.push(line);
+          });
+          flush();
+        });
+      });
+    }
+  }
+  return { courses, skipped };
+}
+
+function mergeCourses(list) {
+  const key = c => [c.name, c.weekday, c.startMin, c.endMin, c.place, c.teacher].join('|');
+  const existing = new Set(state.courses.map(key));
+  let added = 0, dup = 0;
+  list.forEach(c => {
+    if (existing.has(key(c))) dup++;
+    else { existing.add(key(c)); state.courses.push(c); added++; }
+  });
+  return { added, dup };
+}
+
+document.getElementById('import-xlsx')?.addEventListener('change', async event => {
+  const input = event.currentTarget;
+  try {
+    const file = input.files[0];
+    if (!file) return;
+    if (typeof DecompressionStream === 'undefined') throw new Error('no-decompress');
+    const entries = xlsxUnzip(await file.arrayBuffer());
+    const { courses, skipped } = await xlsxParse(entries);
+    if (!courses.length) {
+      alert('没有读到可导入的课程：请确认文件里有「课程明细」或「课程表」工作表');
+      return;
+    }
+    const { added, dup } = mergeCourses(courses);
+    saveState();
+    renderToday();
+    showToast(`导入 ${added} 门课${dup ? `，跳过 ${dup} 条重复` : ''}${skipped ? `，${skipped} 条无法识别已跳过` : ''}`);
+  } catch (err) {
+    alert(err && err.message === 'no-decompress'
+      ? '该浏览器不支持直接读取 Excel，请用新版 Chrome/Edge 打开，或先把课表转成 JSON 再导入'
+      : '导入失败：文件不是有效的课表 Excel，原有数据未改动');
+  } finally {
+    input.value = '';
+  }
 });
 
 </script>
